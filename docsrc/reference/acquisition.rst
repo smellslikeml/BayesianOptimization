@@ -10,5 +10,6 @@
    acquisition/UpperConfidenceBound
    acquisition/ProbabilityOfImprovement
    acquisition/ExpectedImprovement
+   acquisition/LogExpectedImprovement
    acquisition/GPHedge
    acquisition/ConstantLiar

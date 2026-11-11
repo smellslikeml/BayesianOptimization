@@ -4,9 +4,11 @@ The acquisition functions in this module can be grouped the following way:
 
 - One of the base acquisition functions
   (:py:class:`UpperConfidenceBound<bayes_opt.acquisition.UpperConfidenceBound>`,
-  :py:class:`ProbabilityOfImprovement<bayes_opt.acquisition.ProbabilityOfImprovement>` and
-  :py:class:`ExpectedImprovement<bayes_opt.acquisition.ExpectedImprovement>`) is always dictating the basic
-  behavior of the suggestion step. They can be used alone or combined with a meta acquisition function.
+  :py:class:`ProbabilityOfImprovement<bayes_opt.acquisition.ProbabilityOfImprovement>`,
+  :py:class:`ExpectedImprovement<bayes_opt.acquisition.ExpectedImprovement>` and its numerically stable
+  log-scale variant :py:class:`LogExpectedImprovement<bayes_opt.acquisition.LogExpectedImprovement>`) is
+  always dictating the basic behavior of the suggestion step. They can be used alone or combined with a
+  meta acquisition function.
 - :py:class:`GPHedge<bayes_opt.acquisition.GPHedge>` is a meta acquisition function that combines multiple
   base acquisition functions and determines the most suitable one for a particular problem.
 - :py:class:`ConstantLiar<bayes_opt.acquisition.ConstantLiar>` is a meta acquisition function that can be
@@ -30,7 +32,7 @@ from numpy.random import RandomState
 from packaging import version
 from scipy import __version__ as scipy_version
 from scipy.optimize._differentialevolution import DifferentialEvolutionSolver, minimize
-from scipy.special import softmax
+from scipy.special import erfcx, softmax
 from scipy.stats import norm
 from sklearn.gaussian_process import GaussianProcessRegressor
 
@@ -947,6 +949,137 @@ class ExpectedImprovement(AcquisitionFunction):
         self.xi = params["xi"]
         self.exploration_decay = params["exploration_decay"]
         self.exploration_decay_delay = params["exploration_decay_delay"]
+
+
+_LOG_SQRT_2PI = 0.5 * np.log(2 * np.pi)
+_NEG_INV_SQRT2 = -(2**-0.5)
+_LOG_SQRT_PI_DIV_2 = 0.5 * np.log(np.pi / 2)
+
+
+def _log_phi(u: NDArray[Float]) -> NDArray[Float]:
+    """Compute the log of the standard normal PDF, ``log(phi(u))``."""
+    return -0.5 * u * u - _LOG_SQRT_2PI
+
+
+def _log1mexp(x: NDArray[Float]) -> NDArray[Float]:
+    """Compute ``log(1 - exp(x))`` for ``x < 0`` in a numerically stable manner.
+
+    For ``x > -log(2)`` the result is computed as ``log(-expm1(x))``,
+    and as ``log1p(-exp(x))`` otherwise.
+    """
+    return np.where(x > -np.log(2), np.log(-np.expm1(x)), np.log1p(-np.exp(x)))
+
+
+def _log_abs_u_Phi_div_phi(u: NDArray[Float]) -> NDArray[Float]:
+    """Compute ``log(|u| * Phi(u) / phi(u))`` using the scaled complementary error function."""
+    return np.log(erfcx(_NEG_INV_SQRT2 * u) * np.abs(u)) + _LOG_SQRT_PI_DIV_2
+
+
+def _log_ei_helper(u: NDArray[Float]) -> NDArray[Float]:
+    """Compute ``log(phi(u) + u * Phi(u))`` in a numerically stable manner.
+
+    For ``u > -1`` the argument of the logarithm is computed directly, which is
+    safe from cancellation in that regime. For ``u <= -1`` the identity
+    ``phi(u) + u * Phi(u) = phi(u) * (1 - |u| * Phi(u) / phi(u))`` is used
+    together with the scaled complementary error function, since both the PDF
+    and the CDF underflow for sufficiently negative ``u``. For extremely
+    negative ``u`` the MacLaurin approximation ``phi(u) + u * Phi(u) ~= phi(u) / u**2``
+    is used instead. Both branches are evaluated on masked inputs and combined
+    with ``np.where``, so that no NaN/inf of the unused branch can propagate.
+    """
+    u = np.asarray(u, dtype=float)
+    bound = -1.0
+    u_upper = np.where(u < bound, bound, u)
+    log_ei_upper = np.log(norm.pdf(u_upper) + u_upper * norm.cdf(u_upper))
+
+    neg_inv_sqrt_eps = -1e6
+    u_lower = np.where(u > bound, bound, u)
+    u_eps = np.where(u_lower < neg_inv_sqrt_eps, neg_inv_sqrt_eps, u_lower)
+    w = _log_abs_u_Phi_div_phi(u_eps)
+    log_ei_lower = _log_phi(u) + np.where(u > neg_inv_sqrt_eps, _log1mexp(w), -2.0 * np.log(np.abs(u_lower)))
+
+    return np.where(u > bound, log_ei_upper, log_ei_lower)
+
+
+class LogExpectedImprovement(ExpectedImprovement):
+    r"""Logarithm of the Expected Improvement acquisition function.
+
+    Computes the same quantity as `ExpectedImprovement` on a log scale:
+
+    .. math::
+
+        \text{LogEI}(x) = \log\left(\sigma(x)\right) + \log\left(
+            z(x) \Phi\left(z(x)\right) + \phi\left(z(x)\right) \right),
+            \qquad z(x) = \frac{\mu(x)-y_{\text{max}} -  \xi }{\sigma(x)}
+
+    where :math:`\Phi` is the CDF and :math:`\phi` the PDF of the normal
+    distribution. The log improvement term is evaluated in a numerically stable
+    fashion, such that this acquisition function has the same maximizer as
+    `ExpectedImprovement`, while remaining finite and discriminative in regions
+    where the expected improvement itself underflows to zero. The latter can
+    otherwise stall the optimization of the acquisition function.
+
+    For more information, see:
+        Ament et al., "Unexpected Improvements to Expected Improvement for
+        Bayesian Optimization", NeurIPS 2023.
+        https://arxiv.org/abs/2310.20708
+
+    The numerically stable evaluation of the log improvement term follows the
+    analytic derivation in the paper above, as implemented in BoTorch (MIT
+    licensed).
+
+    Note
+    ----
+
+    This acquisition function returns values on a log scale. It therefore must
+    not be combined with meta acquisition functions that mix the values of
+    their base acquisition functions on a linear scale, such as `GPHedge`.
+
+    Parameters
+    ----------
+    xi : float, positive
+        Governs the exploration/exploitation tradeoff. Lower prefers
+        exploitation, higher prefers exploration.
+
+    exploration_decay : float, default None
+        Decay rate for xi. If None, no decay is applied.
+
+    exploration_decay_delay : int, default None
+        Delay for decay. If None, decay is applied from the start.
+
+    random_state : int, RandomState, default None
+        Set the random state for reproducibility.
+    """
+
+    def base_acq(self, mean: NDArray[Float], std: NDArray[Float]) -> NDArray[Float]:
+        """Calculate the logarithm of the expected improvement.
+
+        Parameters
+        ----------
+        mean : np.ndarray
+            Mean of the predictive distribution.
+
+        std : np.ndarray
+            Standard deviation of the predictive distribution.
+
+        Returns
+        -------
+        np.ndarray
+            Acquisition function value on a log scale.
+
+        Raises
+        ------
+        ValueError
+            If y_max is not set.
+        """
+        if self.y_max is None:
+            msg = (
+                "y_max is not set. If you are calling this method outside "
+                "of suggest(), ensure y_max is set, or set it manually."
+            )
+            raise ValueError(msg)
+        z = (mean - self.y_max - self.xi) / std
+        return np.log(std) + _log_ei_helper(z)
 
 
 class ConstantLiar(AcquisitionFunction):

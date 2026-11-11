@@ -14,6 +14,7 @@ from bayes_opt.acquisition import (
     ConstantLiar,
     ExpectedImprovement,
     GPHedge,
+    LogExpectedImprovement,
     ProbabilityOfImprovement,
     UpperConfidenceBound,
 )
@@ -253,6 +254,95 @@ def test_expected_improvement_with_constraints(gp, constrained_target_space, ran
 
     constrained_target_space.register(params={"x": 1.0, "y": 0.0}, target=1.0, constraint_value=1.0)
     acq.suggest(gp=gp, target_space=constrained_target_space, random_state=random_state)
+
+
+def test_log_expected_improvement(gp, target_space, random_state):
+    acq = acquisition.LogExpectedImprovement(exploration_decay=0.5, exploration_decay_delay=2, xi=0.01)
+    assert acq.xi == 0.01
+
+    with pytest.raises(ValueError, match="y_max is not set"):
+        acq.base_acq(0.0, 0.0)
+
+    target_space.register(params={"x": 2.5, "y": 0.5}, target=3.0)
+    acq.suggest(gp=gp, target_space=target_space, random_state=random_state)
+    assert acq.xi == 0.01
+    acq.suggest(gp=gp, target_space=target_space, random_state=random_state)
+    assert acq.xi == 0.005
+
+    acq = acquisition.LogExpectedImprovement(exploration_decay=None, xi=0.01)
+    assert acq.xi == 0.01
+    acq.suggest(gp=gp, target_space=target_space, random_state=random_state)
+    assert acq.xi == 0.01
+    acq.suggest(gp=gp, target_space=target_space, random_state=random_state)
+    assert acq.xi == 0.01
+
+
+def test_log_expected_improvement_matches_expected_improvement(random_state):
+    """Where EI is representable in floating point, LogEI must equal log(EI)."""
+    ei = acquisition.ExpectedImprovement(xi=0.01)
+    log_ei = acquisition.LogExpectedImprovement(xi=0.01)
+    ei.y_max = 1.0
+    log_ei.y_max = 1.0
+
+    mean = 4 * random_state.rand(20) - 2
+    std = random_state.rand(20) + 0.1
+
+    ei_values = ei.base_acq(mean, std)
+    mask = ei_values > 1e-12
+    assert mask.sum() >= 10  # enough non-degenerate points to compare
+    np.testing.assert_allclose(log_ei.base_acq(mean, std)[mask], np.log(ei_values[mask]), rtol=1e-9)
+
+
+def test_log_expected_improvement_finite_where_expected_improvement_underflows():
+    """EI underflows to (tied) zeros for very negative z, LogEI stays finite and ordered."""
+    ei = acquisition.ExpectedImprovement(xi=0.01)
+    log_ei = acquisition.LogExpectedImprovement(xi=0.01)
+    ei.y_max = 0.0
+    log_ei.y_max = 0.0
+
+    z = np.linspace(-300.0, -50.0, 6)
+    mean = z + 0.01  # with std=1: (mean - y_max - xi) / std == z
+    std = np.ones_like(z)
+
+    assert np.all(ei.base_acq(mean, std) == 0.0)
+
+    log_ei_values = log_ei.base_acq(mean, std)
+    assert np.all(np.isfinite(log_ei_values))
+    assert np.all(np.diff(log_ei_values) > 0)
+
+
+def test_log_ei_helper_is_finite_and_monotonic():
+    """The stable log improvement term is finite and strictly increasing in z."""
+    z = np.linspace(-500.0, 50.0, 20_001)
+    values = acquisition._log_ei_helper(z)
+    assert np.all(np.isfinite(values))
+    assert np.all(np.diff(values) > 0)
+
+
+def test_log_expected_improvement_params_roundtrip():
+    acq = acquisition.LogExpectedImprovement(xi=0.01, exploration_decay=0.9, exploration_decay_delay=5)
+    expected_params = {"xi": 0.01, "exploration_decay": 0.9, "exploration_decay_delay": 5}
+    assert acq.get_acquisition_params() == expected_params
+
+    acq.set_acquisition_params({"xi": 0.05, "exploration_decay": 0.8, "exploration_decay_delay": 3})
+    assert acq.get_acquisition_params() == {
+        "xi": 0.05,
+        "exploration_decay": 0.8,
+        "exploration_decay_delay": 3,
+    }
+
+
+def test_log_expected_improvement_converges():
+    optimizer = BayesianOptimization(
+        f=lambda x: -(x - 2) ** 2,
+        pbounds={"x": (-2, 6)},
+        acquisition_function=acquisition.LogExpectedImprovement(xi=0.01),
+        random_state=1,
+        verbose=0,
+    )
+    optimizer.maximize(init_points=3, n_iter=15)
+
+    assert abs(optimizer.max["params"]["x"] - 2.0) < 0.1
 
 
 @pytest.mark.parametrize("strategy", [0.0, "mean", "min", "max"])
@@ -503,6 +593,7 @@ def verify_optimizers_match(optimizer1, optimizer2):
         (lambda: UpperConfidenceBound(kappa=2.576), "ucb_state.json"),
         (lambda: ProbabilityOfImprovement(xi=0.01), "pi_state.json"),
         (lambda: ExpectedImprovement(xi=0.01), "ei_state.json"),
+        (lambda: LogExpectedImprovement(xi=0.01), "log_ei_state.json"),
         (lambda: ConstantLiar(base_acquisition=UpperConfidenceBound(kappa=2.576)), "cl_state.json"),
         (
             lambda: GPHedge(
